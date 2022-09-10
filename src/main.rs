@@ -1,7 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::error::Error;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufStream};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -18,84 +19,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct ReceiveMessage {
-    method: Method,
-    number: serde_json::Number,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum Method {
-    #[serde(rename = "isPrime")]
-    IsPrime,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SendMessage {
-    method: Method,
-    prime: bool,
+#[derive(Debug)]
+enum ReceiveMessage {
+    Insert { timestamp: i32, price: i32 },
+    Query { mintime: i32, maxtime: i32 },
 }
 
 async fn process_socket(mut socket: TcpStream) -> Result<(), Box<dyn Error>> {
+    // split
     let (mut reader, mut writer) = socket.split();
-    let buf_reader = BufReader::new(&mut reader);
 
-    let mut lines = buf_reader.lines();
+    let mut message_buffer = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
-        // parse as ReceiveMessage
-        let message = serde_json::from_str::<ReceiveMessage>(&line);
-        println!("Received: {:?}", message);
-        // if invalid, send back error
-        if message.is_err() {
-            eprintln!("Invalid message: {}", line);
-            eprintln!("Error: {}", message.err().unwrap());
-            let error = serde_json::json!({
-                "error": "Invalid message"
-            });
-            writer.write_all(error.to_string().as_bytes()).await?;
-            // close connection
-            return Ok(());
+    loop {
+        // read 9 bytes
+        let mut buf = [0; 9];
+        reader.read_exact(&mut buf).await?;
+        // parse
+        let message = parse_message(&buf)?;
+        // println!("Parsed message: {:?}", message);
+        match message {
+            ReceiveMessage::Insert { timestamp, price } => {
+                message_buffer.push((timestamp, price));
+            }
+            ReceiveMessage::Query { mintime, maxtime } => {
+                let applicable_prices: Vec<i64> = message_buffer
+                    .iter()
+                    .filter(|(timestamp, _)| *timestamp >= mintime && *timestamp <= maxtime)
+                    .map(|(_, price)| (*price).into())
+                    .collect::<Vec<_>>();
+                // if applicable_messages is empty, then send 0_i32
+                if applicable_prices.is_empty() {
+                    writer.write_all(&0_i32.to_be_bytes()).await?;
+                    continue;
+                }
+                // calculate mean
+                let mean: i32 = (applicable_prices.iter().sum::<i64>()
+                    / applicable_prices.len() as i64)
+                    .try_into()
+                    .unwrap();
+                // write mean
+                writer.write_all(&mean.to_be_bytes()).await?;
+            }
         }
-        let message = message.unwrap();
-        // check if number is prime
-        let is_prime = is_prime(message.number);
-        // send back result
-        let result = SendMessage {
-            method: Method::IsPrime,
-            prime: is_prime,
-        };
-        writer
-            .write_all(serde_json::to_string(&result)?.as_bytes())
-            .await?;
-        // send newline
-        writer.write_all(b"\n").await?;
     }
-
-    Ok(())
 }
 
-fn is_prime(number: serde_json::Number) -> bool {
-    // if non-integral, not prime
-    if !number.is_u64() {
-        return false;
+fn parse_message(data: &[u8; 9]) -> Result<ReceiveMessage, Box<dyn Error>> {
+    let message_type = data[0];
+    let first_number = i32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+    let second_number = i32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+    match message_type {
+        b'I' => Ok(ReceiveMessage::Insert {
+            timestamp: first_number,
+            price: second_number,
+        }),
+        b'Q' => Ok(ReceiveMessage::Query {
+            mintime: first_number,
+            maxtime: second_number,
+        }),
+        _ => Err("Invalid message type".into()),
     }
-    let n = number.as_u64().unwrap();
-    if n <= 1 {
-        return false;
-    }
-    if n <= 3 {
-        return true;
-    }
-    if n % 2 == 0 || n % 3 == 0 {
-        return false;
-    }
-    let mut i = 5;
-    while i * i <= n {
-        if n % i == 0 || n % (i + 2) == 0 {
-            return false;
-        }
-        i += 6;
-    }
-    true
 }
